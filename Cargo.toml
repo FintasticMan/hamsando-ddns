@@ -1,0 +1,19 @@
+[package]
+name = "hamsando-ddns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+addr = "0.15.6"
+anyhow = "1.0.97"
+config = "0.15.11"
+directories = "6.0.0"
+env_logger = "0.11.8"
+hamsando = { git = "https://github.com/FintasticMan/hamsando.git", version = "0.1.0" }
+itertools = "0.14.0"
+log = { version = "0.4.27", features = ["std", "max_level_debug", "release_max_level_warn"] }
+reqwest = { version = "0.12.15", features = ["blocking"] }
+serde = { version = "1.0.219", features = ["derive"] }
+strum = "0.27.1"
+strum_macros = "0.27.1"
+url = { version = "2.5.4", features = ["serde"] }
