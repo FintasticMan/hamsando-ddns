@@ -40,7 +40,7 @@ fn default_ip_oracle() -> Url {
         .expect("unable to parse the default IP oracle")
 }
 
-#[derive(Deserialize, IntoStaticStr)]
+#[derive(Debug, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 enum Ipv4Scope {
@@ -48,7 +48,7 @@ enum Ipv4Scope {
     Public,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DomainConfig {
     name: String,
     ipv4: Option<Ipv4Scope>,
@@ -148,6 +148,7 @@ fn update_dns(
     })
 }
 
+#[derive(Debug)]
 struct DomainInfo<'a> {
     config: &'a DomainConfig,
     name: domain::Name<'a>,
@@ -211,7 +212,7 @@ fn main() -> Result<()> {
                     return None;
                 }
             };
-            let root = match parse_domain_name(&config.name) {
+            let root = match parse_domain_name(root) {
                 Ok(root) => root,
                 Err(e) => {
                     warn!("unable to parse root {root}: {e}");
