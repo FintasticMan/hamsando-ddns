@@ -2,23 +2,25 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
-    process::Command,
 };
 
 use addr::{domain, parse_domain_name};
 use anyhow::{anyhow, bail, Result};
 use config::FileFormat;
 use directories::ProjectDirs;
-use itertools::Itertools;
-use log::{debug, info, warn, LevelFilter};
-use serde::Deserialize;
-use strum_macros::IntoStaticStr;
-use url::Url;
-
 use hamsando::{
     record::{Content, Record, Type},
     Client,
 };
+use itertools::Itertools;
+use log::{debug, info, warn, LevelFilter};
+use pnet::{
+    datalink::{self, NetworkInterface},
+    ipnetwork::IpNetwork,
+};
+use serde::Deserialize;
+use strum_macros::IntoStaticStr;
+use url::Url;
 
 #[derive(Deserialize)]
 struct ApiConfig {
@@ -29,7 +31,6 @@ struct ApiConfig {
 
 #[derive(Deserialize)]
 struct IpConfig {
-    device: String,
     #[serde(default = "default_ip_oracle")]
     ip_oracle: Url,
 }
@@ -63,49 +64,38 @@ struct Config {
     domains: Vec<DomainConfig>,
 }
 
-enum IpVersion {
-    Ipv4,
-    Ipv6,
+fn get_default_interface() -> Result<NetworkInterface> {
+    datalink::interfaces()
+        .into_iter()
+        .find(|i| i.is_up() && !i.is_loopback() && !i.ips.is_empty())
+        .ok_or(anyhow!("no network interface found"))
 }
 
-fn run_ip_command(device: &str, ip_version: &IpVersion) -> Result<String> {
-    let ip_version_arg = match ip_version {
-        IpVersion::Ipv4 => "-4",
-        IpVersion::Ipv6 => "-6",
-    };
-    let ip_output = Command::new("ip")
-        .arg(ip_version_arg)
-        .arg("-o")
-        .arg("address")
-        .arg("show")
-        .arg("scope")
-        .arg("global")
-        .arg("dev")
-        .arg(device)
-        .output()?;
-
-    let ip_output = String::from_utf8(ip_output.stdout)?;
-
-    let first_line = ip_output
-        .lines()
-        .next()
-        .ok_or(anyhow!("empty output from ip command"))?;
-
-    let ip_with_subnet = first_line
-        .split_whitespace()
-        .nth(3)
-        .ok_or(anyhow!("nothing found at expected position"))?;
-
-    let ip = ip_with_subnet
-        .split('/')
-        .next()
-        .ok_or(anyhow!("malformed IP with subnet: {ip_with_subnet:?}"))?;
-    Ok(ip.to_string())
+fn ipv4_is_eligible(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_documentation()
+        && !ip.is_broadcast()
 }
 
-fn get_ipv4_private(device: &str) -> Result<Ipv4Addr> {
-    let ip = run_ip_command(device, &IpVersion::Ipv4)?;
-    Ok(ip.parse()?)
+fn ipv6_is_eligible(ip: Ipv6Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_unique_local()
+        && !ip.is_unicast_link_local()
+}
+
+fn get_ipv4_private() -> Result<Ipv4Addr> {
+    let interface = get_default_interface()?;
+    interface
+        .ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpNetwork::V4(ip) if ipv4_is_eligible(ip.ip()) => Some(ip.ip()),
+            _ => None,
+        })
+        .ok_or(anyhow!("no IPv4 address found"))
 }
 
 fn get_ipv4_public(ip_oracle: Url) -> Result<Ipv4Addr> {
@@ -116,33 +106,42 @@ fn get_ipv4_public(ip_oracle: Url) -> Result<Ipv4Addr> {
         .parse()?)
 }
 
-fn get_ipv6(device: &str) -> Result<Ipv6Addr> {
-    let ip = run_ip_command(device, &IpVersion::Ipv6)?;
-    Ok(ip.parse()?)
+fn get_ipv6() -> Result<Ipv6Addr> {
+    let interface = get_default_interface()?;
+
+    interface
+        .ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpNetwork::V6(ip) if ipv6_is_eligible(ip.ip()) => Some(ip.ip()),
+            _ => None,
+        })
+        .ok_or(anyhow!("no IPv6 address found"))
 }
 
 fn update_dns(
     client: &Client,
     entries: &HashMap<&str, Vec<Record>>,
-    domain: &domain::Name,
+    domain_info: &DomainInfo,
     content: &Content,
 ) -> Result<()> {
-    let root = domain
-        .root()
-        .ok_or(anyhow!("domain name {domain} has no root"))?;
-    let dns: Vec<&Record> = entries[root]
+    let domain = domain_info.name;
+    let root = domain_info.root;
+    let dns: Vec<&Record> = entries[root.as_str()]
         .iter()
         .filter(|record| {
             record.name == domain.as_str() && Type::from(&record.content) == Type::from(&content)
         })
         .collect();
     Ok(match dns.len().cmp(&1) {
-        Ordering::Less => client.create_dns(domain, content, None, None).map(|_| ())?,
+        Ordering::Less => client
+            .create_dns(&domain, content, None, None)
+            .map(|_| ())?,
         Ordering::Equal => {
             if dns[0].content == *content {
                 return Ok(());
             }
-            client.edit_dns(domain, dns[0].id, content, None, None)?
+            client.edit_dns(&domain, dns[0].id, content, None, None)?
         }
         Ordering::Greater => bail!("multiple DNS records for domain {domain}"),
     })
@@ -190,9 +189,18 @@ fn main() -> Result<()> {
     client.test_auth()?;
     info!("successfully authenticated");
 
-    let ipv4_private = get_ipv4_private(&config.ip.device);
+    let ipv4_private = get_ipv4_private();
+    if let Ok(ip) = ipv4_private {
+        info!("private IPv4 address found: {ip}");
+    };
     let ipv4_public = get_ipv4_public(config.ip.ip_oracle);
-    let ipv6 = get_ipv6(&config.ip.device);
+    if let Ok(ip) = ipv4_public {
+        info!("public IPv4 address found: {ip}");
+    };
+    let ipv6 = get_ipv6();
+    if let Ok(ip) = ipv6 {
+        info!("IPv6 address found: {ip}");
+    };
 
     let domains: Vec<DomainInfo> = config
         .domains
@@ -256,13 +264,12 @@ fn main() -> Result<()> {
             };
             match ipv4 {
                 Ok(ipv4) => {
-                    if let Err(e) = update_dns(&client, &entries, &domain.name, &Content::A(*ipv4))
-                    {
+                    if let Err(e) = update_dns(&client, &entries, &domain, &Content::A(*ipv4)) {
                         warn!("updating A record for {} failed: {e}", domain.name);
                     };
                 }
                 Err(e) => {
-                    warn!("unable to get IPv4: {e}");
+                    warn!("unable to update IPv4: {e}");
                 }
             };
         }
@@ -271,14 +278,12 @@ fn main() -> Result<()> {
             info!("updating IPv6 for domain {}", domain.name);
             match &ipv6 {
                 Ok(ipv6) => {
-                    if let Err(e) =
-                        update_dns(&client, &entries, &domain.name, &Content::Aaaa(*ipv6))
-                    {
+                    if let Err(e) = update_dns(&client, &entries, &domain, &Content::Aaaa(*ipv6)) {
                         warn!("updating AAAA record for {} failed: {e}", domain.name);
                     }
                 }
                 Err(e) => {
-                    warn!("unable to get IPv6: {e}");
+                    warn!("unable to update IPv6: {e}");
                 }
             };
         }
