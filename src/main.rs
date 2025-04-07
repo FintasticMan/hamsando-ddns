@@ -2,10 +2,12 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
 };
 
 use addr::{domain, parse_domain_name};
 use anyhow::{anyhow, bail, Result};
+use clap::Parser;
 use config::FileFormat;
 use directories::ProjectDirs;
 use hamsando::{
@@ -87,8 +89,7 @@ fn ipv6_is_eligible(ip: Ipv6Addr) -> bool {
 }
 
 fn get_ipv4_private() -> Result<Ipv4Addr> {
-    let interface = get_default_interface()?;
-    interface
+    get_default_interface()?
         .ips
         .iter()
         .find_map(|ip| match ip {
@@ -107,9 +108,7 @@ fn get_ipv4_public(ip_oracle: Url) -> Result<Ipv4Addr> {
 }
 
 fn get_ipv6() -> Result<Ipv6Addr> {
-    let interface = get_default_interface()?;
-
-    interface
+    get_default_interface()?
         .ips
         .iter()
         .find_map(|ip| match ip {
@@ -154,15 +153,42 @@ struct DomainInfo<'a> {
     root: domain::Name<'a>,
 }
 
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Set a custom config file
+    #[arg(short, long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Control the logging level
+    #[arg(short, action = clap::ArgAction::Count)]
+    verbosity: u8,
+}
+
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let log_level = match cli.verbosity {
+        0 => LevelFilter::Error,
+        1 => LevelFilter::Warn,
+        2 => LevelFilter::Info,
+        3 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    };
+
     env_logger::builder()
-        .filter_level(LevelFilter::max())
+        .filter_level(log_level)
         .parse_default_env()
         .init();
 
-    let project_dirs =
-        ProjectDirs::from("", "", "hamsando").ok_or(anyhow!("unable to find home directory"))?;
-    let config_file = project_dirs.config_dir().join("config.toml");
+    let config_file = match cli.config {
+        Some(config) => config,
+        None => {
+            let project_dirs = ProjectDirs::from("", "", "hamsando")
+                .ok_or(anyhow!("unable to find home directory"))?;
+            project_dirs.config_dir().join("config.toml")
+        }
+    };
 
     debug!(
         "loading configuration from {:?} and environment",
