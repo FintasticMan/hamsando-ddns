@@ -165,6 +165,24 @@ struct Cli {
     verbosity: u8,
 }
 
+fn init_logger(level: LevelFilter) -> Result<()> {
+    #[cfg(not(any(feature = "env_logger", feature = "syslog")))]
+    compile_error!("no logger selected");
+    #[cfg(all(feature = "env_logger", feature = "syslog"))]
+    compile_error!("more than 1 logger selected");
+
+    #[cfg(feature = "env_logger")]
+    env_logger::builder()
+        .filter_level(level)
+        .parse_default_env()
+        .init();
+
+    #[cfg(feature = "syslog")]
+    syslog::init_unix(syslog::Facility::LOG_USER, level)?;
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -176,10 +194,7 @@ fn main() -> Result<()> {
         _ => LevelFilter::Trace,
     };
 
-    env_logger::builder()
-        .filter_level(log_level)
-        .parse_default_env()
-        .init();
+    init_logger(log_level)?;
 
     let config_file = match cli.config {
         Some(config) => config,
