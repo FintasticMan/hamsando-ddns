@@ -33,14 +33,7 @@ struct ApiConfig {
 
 #[derive(Deserialize)]
 struct IpConfig {
-    #[serde(default = "default_ip_oracle")]
     ip_oracle: Url,
-}
-
-fn default_ip_oracle() -> Url {
-    "https://api.ipify.org/"
-        .parse()
-        .expect("unable to parse the default IP oracle")
 }
 
 #[derive(Debug, Deserialize, IntoStaticStr)]
@@ -62,8 +55,17 @@ struct DomainConfig {
 #[derive(Deserialize)]
 struct Config {
     api: ApiConfig,
+    #[serde(default = "default_ip_config")]
     ip: IpConfig,
     domains: Vec<DomainConfig>,
+}
+
+fn default_ip_config() -> IpConfig {
+    IpConfig {
+        ip_oracle: "https://api.ipify.org/"
+            .parse()
+            .expect("unable to parse the default IP oracle"),
+    }
 }
 
 fn get_default_interface() -> Result<NetworkInterface> {
@@ -129,7 +131,7 @@ fn update_dns(
     let dns: Vec<&Record> = entries[root.as_str()]
         .iter()
         .filter(|record| {
-            record.name == domain.as_str() && Type::from(&record.content) == Type::from(&content)
+            record.name == domain.as_str() && Type::from(&record.content) == Type::from(content)
         })
         .collect();
     Ok(match dns.len().cmp(&1) {
