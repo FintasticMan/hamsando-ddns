@@ -68,13 +68,6 @@ fn default_ip_config() -> IpConfig {
     }
 }
 
-fn get_default_interface() -> Result<NetworkInterface> {
-    datalink::interfaces()
-        .into_iter()
-        .find(|i| i.is_up() && !i.is_loopback() && !i.ips.is_empty())
-        .ok_or(anyhow!("no network interface found"))
-}
-
 fn ipv4_is_eligible(ip: Ipv4Addr) -> bool {
     !ip.is_unspecified()
         && !ip.is_loopback()
@@ -90,10 +83,11 @@ fn ipv6_is_eligible(ip: Ipv6Addr) -> bool {
         && !ip.is_unicast_link_local()
 }
 
-fn get_ipv4_private() -> Result<Ipv4Addr> {
-    get_default_interface()?
-        .ips
+fn get_ipv4_private(interfaces: &[NetworkInterface]) -> Result<Ipv4Addr> {
+    interfaces
         .iter()
+        .filter(|i| i.is_up() && !i.is_loopback() && !i.ips.is_empty())
+        .flat_map(|i| i.ips.iter())
         .find_map(|ip| match ip {
             IpNetwork::V4(ip) if ipv4_is_eligible(ip.ip()) => Some(ip.ip()),
             _ => None,
@@ -109,10 +103,11 @@ fn get_ipv4_public(ip_oracle: Url) -> Result<Ipv4Addr> {
         .parse()?)
 }
 
-fn get_ipv6() -> Result<Ipv6Addr> {
-    get_default_interface()?
-        .ips
+fn get_ipv6(interfaces: &[NetworkInterface]) -> Result<Ipv6Addr> {
+    interfaces
         .iter()
+        .filter(|i| i.is_up() && !i.is_loopback() && !i.ips.is_empty())
+        .flat_map(|i| i.ips.iter())
         .find_map(|ip| match ip {
             IpNetwork::V6(ip) if ipv6_is_eligible(ip.ip()) => Some(ip.ip()),
             _ => None,
@@ -232,7 +227,9 @@ fn main() -> Result<()> {
     client.test_auth()?;
     info!("successfully authenticated");
 
-    let ipv4_private = get_ipv4_private();
+    let interfaces = datalink::interfaces();
+
+    let ipv4_private = get_ipv4_private(&interfaces);
     if let Ok(ip) = ipv4_private {
         info!("private IPv4 address found: {ip}");
     };
@@ -240,7 +237,7 @@ fn main() -> Result<()> {
     if let Ok(ip) = ipv4_public {
         info!("public IPv4 address found: {ip}");
     };
-    let ipv6 = get_ipv6();
+    let ipv6 = get_ipv6(&interfaces);
     if let Ok(ip) = ipv6 {
         info!("IPv6 address found: {ip}");
     };
