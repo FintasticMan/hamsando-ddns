@@ -5,12 +5,12 @@ use std::{
     path::PathBuf,
 };
 
-use addr::{domain, parse_domain_name};
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use config::FileFormat;
 use directories::ProjectDirs;
 use hamsando::{
+    domain::{Domain, Root},
     record::{Content, Record, Type},
     Client,
 };
@@ -44,9 +44,15 @@ enum Ipv4Scope {
     Public,
 }
 
+impl Ipv4Scope {
+    fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DomainConfig {
-    name: String,
+    name: Box<Domain>,
     ipv4: Option<Ipv4Scope>,
     #[serde(default)]
     ipv6: bool,
@@ -92,7 +98,7 @@ fn get_ipv4_private(interfaces: &[NetworkInterface]) -> Result<Ipv4Addr> {
             IpNetwork::V4(ip) if ipv4_is_eligible(ip.ip()) => Some(ip.ip()),
             _ => None,
         })
-        .ok_or(anyhow!("no IPv4 address found"))
+        .ok_or_else(|| anyhow!("no IPv4 address found"))
 }
 
 fn get_ipv4_public(ip_oracle: Url) -> Result<Ipv4Addr> {
@@ -112,42 +118,37 @@ fn get_ipv6(interfaces: &[NetworkInterface]) -> Result<Ipv6Addr> {
             IpNetwork::V6(ip) if ipv6_is_eligible(ip.ip()) => Some(ip.ip()),
             _ => None,
         })
-        .ok_or(anyhow!("no IPv6 address found"))
+        .ok_or_else(|| anyhow!("no IPv6 address found"))
 }
 
 fn update_dns(
     client: &Client,
-    entries: &HashMap<&str, Vec<Record>>,
-    domain_info: &DomainInfo,
+    entries: &HashMap<&Root, Vec<Record>>,
+    domain: &Domain,
     content: &Content,
 ) -> Result<()> {
-    let domain = domain_info.name;
-    let root = domain_info.root;
-    let dns: Vec<&Record> = entries[root.as_str()]
+    let dns: Vec<&Record> = entries[domain.root()]
         .iter()
         .filter(|record| {
-            record.name == domain.as_str() && Type::from(&record.content) == Type::from(content)
+            record.name.as_ref() == domain && Type::from(&record.content) == Type::from(content)
         })
         .collect();
-    Ok(match dns.len().cmp(&1) {
-        Ordering::Less => client
-            .create_dns(&domain, content, None, None)
-            .map(|_| ())?,
+    match dns.len().cmp(&1) {
+        Ordering::Less => {
+            client.create_dns(&domain, content, None, None)?;
+            info!("successfully created DNS record");
+        }
         Ordering::Equal => {
             if dns[0].content == *content {
+                info!("DNS record already set");
                 return Ok(());
             }
-            client.edit_dns(&domain, dns[0].id, content, None, None)?
+            client.edit_dns(&domain, dns[0].id, content, None, None)?;
+            info!("successfully updated DNS record");
         }
-        Ordering::Greater => bail!("multiple DNS records for domain {domain}"),
-    })
-}
-
-#[derive(Debug)]
-struct DomainInfo<'a> {
-    config: &'a DomainConfig,
-    name: domain::Name<'a>,
-    root: domain::Name<'a>,
+        Ordering::Greater => bail!("multiple DNS records for domain {}", domain.as_str()),
+    }
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -197,7 +198,7 @@ fn main() -> Result<()> {
         Some(config) => config,
         None => {
             let project_dirs = ProjectDirs::from("", "", "hamsando")
-                .ok_or(anyhow!("unable to find home directory"))?;
+                .ok_or_else(|| anyhow!("unable to find home directory"))?;
             project_dirs.config_dir().join("config.toml")
         }
     };
@@ -211,7 +212,7 @@ fn main() -> Result<()> {
         .add_source(config::File::new(
             config_file
                 .to_str()
-                .ok_or(anyhow!("config file path is not valid UTF-8"))?,
+                .ok_or_else(|| anyhow!("config file path is not valid UTF-8"))?,
             FileFormat::Toml,
         ))
         .add_source(config::Environment::with_prefix("HAMSANDO"))
@@ -242,60 +243,31 @@ fn main() -> Result<()> {
         info!("IPv6 address found: {ip}");
     };
 
-    let domains: Vec<DomainInfo> = config
-        .domains
-        .iter()
-        .filter_map(|config| {
-            let name = match parse_domain_name(&config.name) {
-                Ok(name) => name,
-                Err(e) => {
-                    warn!("unable to parse domain name {}: {e}", config.name);
-                    return None;
-                }
-            };
-            let root = match name.root() {
-                Some(root) => root,
-                None => {
-                    warn!("domain name {name} has no root");
-                    return None;
-                }
-            };
-            let root = match parse_domain_name(root) {
-                Ok(root) => root,
-                Err(e) => {
-                    warn!("unable to parse root {root}: {e}");
-                    return None;
-                }
-            };
+    let domains: Vec<&DomainConfig> = config.domains.iter().unique_by(|d| &d.name).collect();
 
-            Some(DomainInfo { config, name, root })
-        })
-        .unique_by(|info| info.name)
-        .collect();
-
-    let entries: HashMap<&str, Vec<Record>> = domains
+    let entries: HashMap<&Root, Vec<Record>> = domains
         .iter()
-        .unique_by(|info| info.root)
-        .filter_map(|info| {
-            let records = match client.retrieve_dns(&info.root, None) {
+        .unique_by(|d| d.name.root())
+        .filter_map(|d| {
+            let records = match client.retrieve_dns(d.name.root(), None) {
                 Ok(records) => records,
                 Err(e) => {
                     warn!(
                         "unable to retrieve records for domain name {}: {e}",
-                        info.root
+                        d.name.root()
                     );
                     return None;
                 }
             };
-            Some((info.root.as_str(), records))
+            Some((d.name.root(), records))
         })
         .collect();
 
     for domain in domains.iter() {
-        if let Some(scope) = &domain.config.ipv4 {
+        if let Some(scope) = &domain.ipv4 {
             info!(
                 "updating IPv4 to {} IP for domain {}",
-                Into::<&'static str>::into(scope),
+                scope.as_str(),
                 domain.name
             );
             let ipv4 = match scope {
@@ -304,9 +276,10 @@ fn main() -> Result<()> {
             };
             match ipv4 {
                 Ok(ipv4) => {
-                    if let Err(e) = update_dns(&client, &entries, &domain, &Content::A(*ipv4)) {
+                    if let Err(e) = update_dns(&client, &entries, &domain.name, &Content::A(*ipv4))
+                    {
                         warn!("updating A record for {} failed: {e}", domain.name);
-                    };
+                    }
                 }
                 Err(e) => {
                     warn!("unable to update IPv4: {e}");
@@ -314,11 +287,13 @@ fn main() -> Result<()> {
             };
         }
 
-        if domain.config.ipv6 {
+        if domain.ipv6 {
             info!("updating IPv6 for domain {}", domain.name);
             match &ipv6 {
                 Ok(ipv6) => {
-                    if let Err(e) = update_dns(&client, &entries, &domain, &Content::Aaaa(*ipv6)) {
+                    if let Err(e) =
+                        update_dns(&client, &entries, &domain.name, &Content::Aaaa(*ipv6))
+                    {
                         warn!("updating AAAA record for {} failed: {e}", domain.name);
                     }
                 }

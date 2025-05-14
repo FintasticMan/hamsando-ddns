@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-addr = "0.15.6"
-anyhow = "1.0.97"
-clap = { version = "4.5.35", features = ["derive"] }
+anyhow = "1.0.98"
+clap = { version = "4.5.38", features = ["derive"] }
 config = "0.15.11"
 directories = "6.0.0"
 env_logger = { version = "0.11.8", optional = true }
