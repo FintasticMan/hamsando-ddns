@@ -5,23 +5,23 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use config::FileFormat;
 use directories::ProjectDirs;
 use hamsando::{
+    blocking::Client,
     domain::{Domain, Root},
     record::{Content, Record, Type},
-    Client,
 };
 use itertools::Itertools;
-use log::{debug, info, warn, LevelFilter};
+use log::{LevelFilter, debug, info, warn};
 use pnet::{
     datalink::{self, NetworkInterface},
     ipnetwork::IpNetwork,
 };
 use serde::Deserialize;
-use strum_macros::IntoStaticStr;
+use strum::IntoStaticStr;
 use url::Url;
 
 #[derive(Deserialize)]
@@ -31,9 +31,24 @@ struct ApiConfig {
     secretapikey: String,
 }
 
+fn default_ip_oracle() -> Url {
+    "https://api.ipify.org/"
+        .parse()
+        .expect("unable to parse the default IP oracle")
+}
+
 #[derive(Deserialize)]
 struct IpConfig {
+    #[serde(default = "default_ip_oracle")]
     ip_oracle: Url,
+}
+
+impl Default for IpConfig {
+    fn default() -> Self {
+        IpConfig {
+            ip_oracle: default_ip_oracle(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, IntoStaticStr)]
@@ -61,17 +76,9 @@ struct DomainConfig {
 #[derive(Deserialize)]
 struct Config {
     api: ApiConfig,
-    #[serde(default = "default_ip_config")]
+    #[serde(default)]
     ip: IpConfig,
     domains: Vec<DomainConfig>,
-}
-
-fn default_ip_config() -> IpConfig {
-    IpConfig {
-        ip_oracle: "https://api.ipify.org/"
-            .parse()
-            .expect("unable to parse the default IP oracle"),
-    }
 }
 
 fn ipv4_is_eligible(ip: Ipv4Addr) -> bool {
@@ -135,7 +142,7 @@ fn update_dns(
         .collect();
     match dns.len().cmp(&1) {
         Ordering::Less => {
-            client.create_dns(&domain, content, None, None)?;
+            client.create_dns(domain, content, None, None)?;
             info!("successfully created DNS record");
         }
         Ordering::Equal => {
@@ -143,7 +150,7 @@ fn update_dns(
                 info!("DNS record already set");
                 return Ok(());
             }
-            client.edit_dns(&domain, dns[0].id, content, None, None)?;
+            client.edit_dns(domain, dns[0].id, content, None, None)?;
             info!("successfully updated DNS record");
         }
         Ordering::Greater => bail!("multiple DNS records for domain {}", domain.as_str()),
@@ -221,9 +228,9 @@ fn main() -> Result<()> {
     let config: Config = config.try_deserialize()?;
 
     let client = Client::builder()
-        .apikey(&config.api.apikey)
-        .secretapikey(&config.api.secretapikey)
-        .endpoint_if_some(config.api.endpoint.as_ref())
+        .apikey(config.api.apikey)
+        .secretapikey(config.api.secretapikey)
+        .endpoint_if_some(config.api.endpoint)
         .build()?;
     client.test_auth()?;
     info!("successfully authenticated");
@@ -263,7 +270,7 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    for domain in domains.iter() {
+    for domain in domains {
         if let Some(scope) = &domain.ipv4 {
             info!(
                 "updating IPv4 to {} IP for domain {}",
